@@ -1,19 +1,25 @@
 import os
 import uuid
 import asyncio
+import aiohttp
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
-import requests
 from docx import Document as DocxDocument
 import PyPDF2
 import pandas as pd
 from pptx import Presentation
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 
 JOBS = {}
+MAX_CONCURRENT = 50
+MAX_PAGES = 500
+executor = ThreadPoolExecutor(max_workers=20)
 
 def safe_filename(url, ext='txt'):
-    name = url.replace("https://", "").replace("http://", "").replace("/", "__")
-    return f"{name}.{ext}"
+    hash_part = hashlib.md5(url.encode()).hexdigest()[:8]
+    name = url.replace("https://", "").replace("http://", "").replace("/", "__")[:150]
+    return f"{name}_{hash_part}.{ext}"
 
 def extract_docx(path):
     doc = DocxDocument(path)
@@ -69,75 +75,126 @@ def list_results(domain):
 def get_result_file(domain, filename):
     return os.path.join(f"output_{domain}", filename)
 
+async def fetch_url(session, url):
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15), ssl=False) as resp:
+            if resp.status == 200:
+                return await resp.text()
+    except:
+        pass
+    return None
+
+async def download_file(session, url, path):
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30), ssl=False) as resp:
+            if resp.status == 200:
+                with open(path, 'wb') as f:
+                    async for chunk in resp.content.iter_chunked(8192):
+                        f.write(chunk)
+                return True
+    except:
+        pass
+    return False
+
 async def scrape_site(start_url, use_js, doc_types, out_dir, job_id):
     visited = set()
     queue = [start_url]
-    all_files = []
-    progress = 0
-
-    while queue:
-        url = queue.pop(0)
-        if url in visited or not url.startswith("http"):
-            continue
-        visited.add(url)
-        try:
-            resp = requests.get(url, timeout=15)
-            resp.raise_for_status()
-            html = resp.text
-        except Exception as e:
-            continue
-
-        soup = BeautifulSoup(html, 'html.parser')
-        text = soup.get_text()
-        title = soup.title.string if soup.title else ""
-
-        filename = safe_filename(url, 'txt')
-        with open(os.path.join(out_dir, filename), "w", encoding="utf-8") as f:
-            f.write(f"URL: {url}\nTitle: {title}\n\n{text}")
-
-        all_files.append(filename)
-
-        for a_tag in soup.find_all('a', href=True):
-            href = urljoin(url, a_tag['href'])
-            if is_document_link(href, doc_types):
-                try:
-                    ext = href.split('.')[-1].lower()
-                    doc_filename = safe_filename(href, ext)
-                    doc_path = os.path.join(out_dir, doc_filename)
-                    r = requests.get(href, timeout=20)
-                    with open(doc_path, "wb") as doc_file:
-                        doc_file.write(r.content)
-                    extracted = ""
-                    if ext == "docx":
-                        extracted = extract_docx(doc_path)
-                    elif ext == "pdf":
-                        extracted = extract_pdf(doc_path)
-                    elif ext == "csv":
-                        extracted = extract_csv(doc_path)
-                    elif ext in ["xlsx", "xls"]:
-                        extracted = extract_xlsx(doc_path)
-                    elif ext == "pptx":
-                        extracted = extract_pptx(doc_path)
-                    elif ext == "txt":
-                        with open(doc_path, "r", encoding="utf-8", errors="ignore") as tf:
-                            extracted = tf.read()
-                    if extracted:
-                        with open(os.path.join(out_dir, doc_filename+".txt"), "w", encoding="utf-8") as ef:
-                            ef.write(extracted)
-                    all_files.append(doc_filename)
-                except Exception as e:
+    base_domain = urlparse(start_url).netloc
+    doc_tasks = []
+    
+    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT, limit_per_host=20, force_close=False, enable_cleanup_closed=True)
+    timeout = aiohttp.ClientTimeout(total=15, connect=5)
+    
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        while queue and len(visited) < MAX_PAGES:
+            batch_size = min(MAX_CONCURRENT, len(queue))
+            batch = queue[:batch_size]
+            queue = queue[batch_size:]
+            
+            tasks = []
+            for url in batch:
+                if url not in visited and url.startswith("http"):
+                    visited.add(url)
+                    tasks.append(fetch_url(session, url))
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            new_links = []
+            for i, html in enumerate(results):
+                if html is None or isinstance(html, Exception):
                     continue
-            elif is_internal_link(href, urlparse(start_url).netloc) and href not in visited:
-                queue.append(href)
-
-        progress = int(len(visited) / (len(visited)+len(queue)+1) * 100)
-        JOBS[job_id]["progress"] = progress
-
+                
+                url = batch[i]
+                try:
+                    soup = BeautifulSoup(html, 'lxml')
+                except:
+                    soup = BeautifulSoup(html, 'html.parser')
+                
+                text = soup.get_text(separator='\n', strip=True)
+                title = soup.title.string if soup.title else ""
+                
+                filename = safe_filename(url, 'txt')
+                with open(os.path.join(out_dir, filename), "w", encoding="utf-8") as f:
+                    f.write(f"URL: {url}\nTitle: {title}\n\n{text}")
+                
+                for a_tag in soup.find_all('a', href=True):
+                    href = urljoin(url, a_tag['href'])
+                    
+                    if is_document_link(href, doc_types):
+                        doc_tasks.append(process_document(session, href, doc_types, out_dir))
+                    elif is_internal_link(href, base_domain) and href not in visited:
+                        new_links.append(href)
+                
+                JOBS[job_id]["progress"] = min(95, int(len(visited) / MAX_PAGES * 100))
+            
+            queue.extend([link for link in new_links if link not in queue])
+        
+        if doc_tasks:
+            await asyncio.gather(*doc_tasks, return_exceptions=True)
+    
     JOBS[job_id]["status"] = "done"
     JOBS[job_id]["progress"] = 100
 
+async def process_document(session, url, doc_types, out_dir):
+    try:
+        ext = url.split('.')[-1].lower().split('?')[0]
+        if ext not in doc_types:
+            return
+        
+        doc_filename = safe_filename(url, ext)
+        doc_path = os.path.join(out_dir, doc_filename)
+        
+        if await download_file(session, url, doc_path):
+            loop = asyncio.get_event_loop()
+            extracted = await loop.run_in_executor(executor, extract_document, doc_path, ext)
+            
+            if extracted:
+                with open(os.path.join(out_dir, doc_filename+".txt"), "w", encoding="utf-8") as ef:
+                    ef.write(extracted)
+    except:
+        pass
+
+def extract_document(path, ext):
+    try:
+        if ext == "docx":
+            return extract_docx(path)
+        elif ext == "pdf":
+            return extract_pdf(path)
+        elif ext == "csv":
+            return extract_csv(path)
+        elif ext in ["xlsx", "xls"]:
+            return extract_xlsx(path)
+        elif ext == "pptx":
+            return extract_pptx(path)
+        elif ext == "txt":
+            with open(path, "r", encoding="utf-8", errors="ignore") as tf:
+                return tf.read()
+    except:
+        pass
+    return ""
+
 def is_document_link(link, doc_types):
-    return any(link.lower().endswith(f".{ext}") for ext in doc_types)
+    return any(link.lower().split('?')[0].endswith(f".{ext}") for ext in doc_types)
 
 def is_internal_link(link, base_domain):
     parsed_link = urlparse(link)
